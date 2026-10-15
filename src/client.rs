@@ -203,16 +203,6 @@ impl Iterator for ClientConnection {
                                  // se we have to close
                 }
 
-                Err(ReadError::ReadIoError(ref err)) if err.kind() == ErrorKind::TimedOut => {
-                    // request timeout
-                    let writer = self.sink.next().unwrap();
-                    let response = Response::new_empty(StatusCode(408));
-                    response
-                        .raw_print(writer, HTTPVersion(1, 1), &[], false, None)
-                        .ok();
-                    return None; // closing the connection
-                }
-
                 Err(ReadError::ExpectationFailed(ver)) => {
                     let writer = self.sink.next().unwrap();
                     let response = Response::new_empty(StatusCode(417));

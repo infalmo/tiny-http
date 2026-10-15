@@ -177,6 +177,12 @@ pub struct ServerConfig {
 
     /// If `Some`, then the server will use SSL to encode the communications.
     pub ssl: Option<SslConfig>,
+
+    /// Kernel listen backlog, and number of connection threads.
+    pub backlog: usize,
+
+    /// Idle time after which a kept-alive connection is closed.
+    pub keep_alive: Option<Duration>,
 }
 
 /// Configuration of the server for SSL.
@@ -198,6 +204,8 @@ impl Server {
         Server::new(ServerConfig {
             addr: ConfigListenAddr::from_socket_addrs(addr)?,
             ssl: None,
+            backlog: 1024,
+            keep_alive: Some(Duration::from_secs(30)),
         })
     }
 
@@ -214,6 +222,8 @@ impl Server {
         Server::new(ServerConfig {
             addr: ConfigListenAddr::from_socket_addrs(addr)?,
             ssl: Some(config),
+            backlog: 1024,
+            keep_alive: Some(Duration::from_secs(30)),
         })
     }
 
@@ -226,13 +236,15 @@ impl Server {
         Server::new(ServerConfig {
             addr: ConfigListenAddr::unix_from_path(path),
             ssl: None,
+            backlog: 1024,
+            keep_alive: Some(Duration::from_secs(30)),
         })
     }
 
     /// Builds a new server that listens on the specified address.
     pub fn new(config: ServerConfig) -> Result<Server, Box<dyn Error + Send + Sync + 'static>> {
         let listener = config.addr.bind()?;
-        Self::from_listener(listener, config.ssl)
+        Self::from_listener(listener, config.ssl, config.backlog, config.keep_alive)
     }
 
     /// Builds a new server using the specified TCP listener.
@@ -242,8 +254,11 @@ impl Server {
     pub fn from_listener<L: Into<Listener>>(
         listener: L,
         ssl_config: Option<SslConfig>,
+        backlog: usize,
+        keep_alive: Option<Duration>,
     ) -> Result<Server, Box<dyn Error + Send + Sync + 'static>> {
         let listener = listener.into();
+        listener.set_backlog(backlog)?;
         // building the "close" variable
         let close_trigger = Arc::new(AtomicBool::new(false));
 
@@ -287,12 +302,16 @@ impl Server {
         let inside_messages = messages.clone();
         thread::spawn(move || {
             // a tasks pool is used to dispatch the connections into threads
-            let tasks_pool = util::TaskPool::new();
+            let tasks_pool = rayon::ThreadPoolBuilder::new()
+                .num_threads(backlog)
+                .build()
+                .unwrap();
 
             log::debug!("Running accept thread");
             while !inside_close_trigger.load(Relaxed) {
                 let new_client = match server.accept() {
                     Ok((sock, _)) => {
+                        sock.set_read_timeout(keep_alive).ok();
                         use util::RefinedTcpStream;
                         let (read_closable, write_closable) = match ssl {
                             None => RefinedTcpStream::new(sock),
@@ -319,23 +338,20 @@ impl Server {
                 match new_client {
                     Ok(client) => {
                         let messages = inside_messages.clone();
-                        let mut client = Some(client);
-                        tasks_pool.spawn(Box::new(move || {
-                            if let Some(client) = client.take() {
-                                // Synchronization is needed for HTTPS requests to avoid a deadlock
-                                if client.secure() {
-                                    let (sender, receiver) = mpsc::channel();
-                                    for rq in client {
-                                        messages.push(rq.with_notify_sender(sender.clone()).into());
-                                        receiver.recv().unwrap();
-                                    }
-                                } else {
-                                    for rq in client {
-                                        messages.push(rq.into());
-                                    }
+                        tasks_pool.spawn(move || {
+                            // Synchronization is needed for HTTPS requests to avoid a deadlock
+                            if client.secure() {
+                                let (sender, receiver) = mpsc::channel();
+                                for rq in client {
+                                    messages.push(rq.with_notify_sender(sender.clone()).into());
+                                    receiver.recv().unwrap();
+                                }
+                            } else {
+                                for rq in client {
+                                    messages.push(rq.into());
                                 }
                             }
-                        }));
+                        });
                     }
 
                     Err(e) => {

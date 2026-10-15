@@ -5,6 +5,7 @@ use std::os::unix::net as unix_net;
 use std::{
     net::{Shutdown, SocketAddr, TcpListener, TcpStream, ToSocketAddrs},
     path::PathBuf,
+    time::Duration,
 };
 
 /// Unified listener. Either a [`TcpListener`] or [`std::os::unix::net::UnixListener`]
@@ -19,6 +20,14 @@ impl Listener {
             Self::Tcp(l) => l.local_addr().map(ListenAddr::from),
             #[cfg(unix)]
             Self::Unix(l) => l.local_addr().map(ListenAddr::from),
+        }
+    }
+
+    pub(crate) fn set_backlog(&self, n: usize) -> std::io::Result<()> {
+        match self {
+            Self::Tcp(l) => socket2::SockRef::from(l).listen(n as i32),
+            #[cfg(unix)]
+            Self::Unix(l) => socket2::SockRef::from(l).listen(n as i32),
         }
     }
 
@@ -92,6 +101,14 @@ impl Connection {
             Self::Tcp(s) => s.shutdown(how),
             #[cfg(unix)]
             Self::Unix(s) => s.shutdown(how),
+        }
+    }
+
+    pub(crate) fn set_read_timeout(&self, d: Option<Duration>) -> std::io::Result<()> {
+        match self {
+            Self::Tcp(s) => s.set_read_timeout(d),
+            #[cfg(unix)]
+            Self::Unix(s) => s.set_read_timeout(d),
         }
     }
 
